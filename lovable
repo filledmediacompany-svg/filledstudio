@@ -1,0 +1,334 @@
+import { promises as fs } from "fs";
+import path from "path";
+import { supabase, type Project, setStatus, setError } from "./supabase.js";
+import { tmpDir, downloadYouTube, downloadFromSupabase, extractAudio, getDuration, renderClip } from "./ffmpeg.js";
+import { transcribe } from "./transcribe.js";
+import { detectClips } from "./ai.js";
+
+const SUPABASE_URL = process.env.SUPABASE_URL!;
+const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+
+export async function processProject(project: Project): Promise<void> {
+  console.log(`[${project.id}] start: ${project.title}`);
+  const work = await tmpDir(`proj-${project.id}-`);
+
+  try {
+    // 1. Acquire source
+    let srcPath: string;
+    if (project.source_type === "youtube") {
+      if (!project.source_url) throw new Error("missing source_url");
+      srcPath = await downloadYouTube(project.source_url, work);
+    } else {
+      if (!project.source_storage_key) throw new Error("missing source_storage_key");
+      srcPath = await downloadFromSupabase(SUPABASE_URL, SERVICE_KEY, "uploads", project.source_storage_key, work);
+    }
+    console.log(`[${project.id}] source ready: ${srcPath}`);
+
+    // 2. Probe duration
+    const duration = await getDuration(srcPath);
+    await setStatus(project.id, "processing", { duration_seconds: Math.round(duration) });
+
+    // 3. Audio + transcribe
+    const audio = await extractAudio(srcPath, work);
+    const transcript = await transcribe(audio);
+    console.log(`[${project.id}] transcribed ${transcript.segments.length} segments`);
+
+    await supabase.from("projects").update({
+      transcript: { segments: transcript.segments, text: transcript.text.slice(0, 50000) },
+    }).eq("id", project.id);
+
+    // 4. AI clip detection
+    const detected = await detectClips(transcript.text, duration);
+    console.log(`[${project.id}] detected ${detected.length} clips`);
+
+    const clipRows = detected.map((c) => ({
+      project_id: project.id,
+      user_id: project.user_id,
+      title: c.title,
+      hook: c.hook,
+      start_seconds: c.start_seconds,
+      end_seconds: c.end_seconds,
+      virality_score: Math.round(c.virality_score),
+      status: "rendering" as const,
+    }));
+    const { data: insertedClips, error: insErr } = await supabase.from("clips").insert(clipRows).select();
+    if (insErr) throw insErr;
+
+    // 5. Render each clip (sequential to keep memory low)
+    for (const clip of insertedClips ?? []) {
+      const outPath = path.join(work, `clip-${clip.id}.mp4`);
+      try {
+        await renderClip({
+          source: srcPath,
+          start: Number(clip.start_seconds),
+          end: Number(clip.end_seconds),
+          outPath,
+          title: clip.title,
+        });
+        // Upload
+        const buf = await fs.readFile(outPath);
+        const key = `${project.user_id}/${project.id}/${clip.id}.mp4`;
+        const { error: upErr } = await supabase.storage.from("renders").upload(key, buf, {
+          contentType: "video/mp4",
+          upsert: true,
+        });
+        if (upErr) throw upErr;
+        const { data: pub } = supabase.storage.from("renders").getPublicUrl(key);
+        await supabase.from("clips").update({
+          status: "ready",
+          output_url: pub.publicUrl,
+        }).eq("id", clip.id);
+        console.log(`[${project.id}] clip ${clip.id} ready`);
+      } catch (e) {
+        console.error(`[${project.id}] clip ${clip.id} failed`, e);
+        await supabase.from("clips").update({ status: "failed" }).eq("id", clip.id);
+      }
+    }
+
+    await setStatus(project.id, "ready");
+    console.log(`[${project.id}] done`);
+  } catch (e) {
+    console.error(`[${project.id}] FAILED`, e);
+    await setError(project.id, e instanceof Error ? e.message : String(e));
+  } finally {
+    // Cleanup tmp
+    fs.rm(work, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+import { createClient } from "@supabase/supabase-js";
+
+const SUPABASE_URL = process.env.SUPABASE_URL!;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
+}
+
+export const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { autoRefreshToken: false, persistSession: false },
+});
+
+export type Project = {
+  id: string;
+  user_id: string;
+  title: string;
+  source_type: "youtube" | "upload";
+  source_url: string | null;
+  source_storage_key: string | null;
+  status: string;
+  duration_seconds: number | null;
+};
+
+export async function claimNextProject(): Promise<Project | null> {
+  // Atomic-ish claim: pick oldest queued, mark processing
+  const { data: queued } = await supabase
+    .from("projects")
+    .select("id")
+    .eq("status", "queued")
+    .order("created_at", { ascending: true })
+    .limit(1);
+  if (!queued || queued.length === 0) return null;
+
+  const id = queued[0].id;
+  const { data, error } = await supabase
+    .from("projects")
+    .update({ status: "processing", error_message: null })
+    .eq("id", id)
+    .eq("status", "queued")
+    .select()
+    .single();
+  if (error || !data) return null;
+  return data as Project;
+}
+
+export async function setStatus(projectId: string, status: string, fields: Record<string, unknown> = {}) {
+  await supabase.from("projects").update({ status, ...fields }).eq("id", projectId);
+}
+
+export async function setError(projectId: string, msg: string) {
+  await supabase
+    .from("projects")
+    .update({ status: "failed", error_message: msg.slice(0, 500) })
+    .eq("id", projectId);
+}
+
+import { promises as fs } from "fs";
+import FormData from "form-data";
+import fetch from "node-fetch";
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+export type Transcript = {
+  text: string;
+  segments: Array<{ start: number; end: number; text: string }>;
+};
+
+/** OpenAI Whisper API. Returns verbose_json with segments. */
+export async function transcribe(audioPath: string): Promise<Transcript> {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY missing");
+  const buf = await fs.readFile(audioPath);
+  const form = new FormData();
+  form.append("file", buf, { filename: "audio.mp3", contentType: "audio/mpeg" });
+  form.append("model", "whisper-1");
+  form.append("response_format", "verbose_json");
+  form.append("timestamp_granularities[]", "segment");
+
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...form.getHeaders() },
+    body: form,
+  });
+  if (!res.ok) throw new Error(`Whisper API ${res.status}: ${await res.text()}`);
+  const json: any = await res.json();
+  return {
+    text: json.text,
+    segments: (json.segments ?? []).map((s: any) => ({ start: s.start, end: s.end, text: s.text })),
+  };
+}
+
+import fetch from "node-fetch";
+
+const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
+
+export type DetectedClip = {
+  title: string;
+  hook: string;
+  start_seconds: number;
+  end_seconds: number;
+  virality_score: number;
+};
+
+export async function detectClips(transcriptText: string, duration: number): Promise<DetectedClip[]> {
+  if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY missing");
+  const system =
+    "You are an expert short-form video editor. Given a podcast transcript, identify the 5 most viral 30-90 second moments. Score by hook strength, emotional payoff, and shareability. Return JSON only.";
+  const user = `Transcript (duration ${duration}s):\n${transcriptText}\n\nReturn JSON: { "clips": [{ "title": string, "hook": string, "start_seconds": number, "end_seconds": number, "virality_score": number 0-100 }] }`;
+
+  const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "google/gemini-2.5-flash",
+      messages: [{ role: "system", content: system }, { role: "user", content: user }],
+      response_format: { type: "json_object" },
+    }),
+  });
+  if (!res.ok) throw new Error(`AI gateway ${res.status}: ${await res.text()}`);
+  const json: any = await res.json();
+  const parsed = JSON.parse(json.choices[0].message.content);
+  return parsed.clips as DetectedClip[];
+}
+
+import { execa } from "execa";
+import { promises as fs } from "fs";
+import path from "path";
+import os from "os";
+
+export async function tmpDir(prefix = "fs-"): Promise<string> {
+  return await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+}
+
+export async function downloadYouTube(url: string, outDir: string): Promise<string> {
+  const out = path.join(outDir, "source.%(ext)s");
+  await execa("yt-dlp", [
+    "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+    "--merge-output-format", "mp4",
+    "-o", out,
+    url,
+  ], { stdio: "inherit" });
+  // Find the file
+  const files = await fs.readdir(outDir);
+  const src = files.find((f) => f.startsWith("source."));
+  if (!src) throw new Error("yt-dlp produced no file");
+  return path.join(outDir, src);
+}
+
+export async function downloadFromSupabase(supabaseUrl: string, serviceKey: string, bucket: string, key: string, outDir: string): Promise<string> {
+  const r = await fetch(`${supabaseUrl}/storage/v1/object/${bucket}/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${serviceKey}` },
+  });
+  if (!r.ok) throw new Error(`Storage download failed ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const out = path.join(outDir, path.basename(key));
+  await fs.writeFile(out, buf);
+  return out;
+}
+
+export async function extractAudio(videoPath: string, outDir: string): Promise<string> {
+  const out = path.join(outDir, "audio.mp3");
+  await execa("ffmpeg", ["-y", "-i", videoPath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", out], { stdio: "inherit" });
+  return out;
+}
+
+export async function getDuration(videoPath: string): Promise<number> {
+  const { stdout } = await execa("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", videoPath]);
+  return parseFloat(stdout.trim());
+}
+
+/**
+ * Render a vertical 9:16 short clip with burned-in captions and optional B-roll overlay.
+ * Captions: drawtext at bottom-third, gold accent, large display font.
+ */
+export async function renderClip(opts: {
+  source: string;
+  start: number;
+  end: number;
+  outPath: string;
+  title: string;
+}): Promise<void> {
+  const { source, start, end, outPath, title } = opts;
+  const duration = end - start;
+  // Title escape for drawtext
+  const safe = title.replace(/['":\\%]/g, " ").slice(0, 80);
+  const filter = [
+    `[0:v]trim=start=${start}:duration=${duration},setpts=PTS-STARTPTS,`,
+    `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,`,
+    `drawtext=text='${safe}':fontcolor=white:fontsize=64:box=1:boxcolor=black@0.6:boxborderw=20:x=(w-text_w)/2:y=h-360`,
+    `[v]`,
+  ].join("");
+  await execa("ffmpeg", [
+    "-y",
+    "-i", source,
+    "-filter_complex", filter,
+    "-map", "[v]",
+    "-map", `0:a`,
+    "-ss", String(start),
+    "-t", String(duration),
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+    "-c:a", "aac", "-b:a", "128k",
+    "-movflags", "+faststart",
+    outPath,
+  ], { stdio: "inherit" });
+}
+
+import { claimNextProject } from "./supabase.js";
+import { processProject } from "./pipeline.js";
+
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
+
+async function loop() {
+  console.log("Filled Studio worker started. Polling every", POLL_INTERVAL_MS, "ms");
+  let processing = false;
+  while (true) {
+    if (!processing) {
+      processing = true;
+      try {
+        const project = await claimNextProject();
+        if (project) {
+          await processProject(project);
+        }
+      } catch (e) {
+        console.error("loop error", e);
+      } finally {
+        processing = false;
+      }
+    }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
+
+loop().catch((e) => {
+  console.error("Fatal worker error", e);
+  process.exit(1);
+});
